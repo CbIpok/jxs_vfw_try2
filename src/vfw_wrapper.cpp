@@ -6,6 +6,9 @@
 #include <iostream>
 #include <filesystem>
 #include <cstring>
+#include <cstdio>     // _popen / _pclose
+#include <cerrno>
+
 using namespace std::string_literals;
 
 // ------------------------------------------------------------------+
@@ -13,40 +16,39 @@ using namespace std::string_literals;
 static std::string narrow(const std::wstring& ws)
 {
     if (ws.empty()) return {};
-    int n = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    int n = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1,
+                                  nullptr, 0, nullptr, nullptr);
     std::string out(n - 1, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), n, nullptr, nullptr);
+    ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1,
+                          out.data(), n, nullptr, nullptr);
     return out;
 }
 
-// Полный захват stdout+stderr сторонней программы
+// ------------------------------------------------------------------+
+// Захват stdout+stderr без временных файлов
 static std::string exec(const std::string& cmd)
 {
-    std::cout << "[exec] raw cmd: " << cmd << '\n';
-    char tmpName[L_tmpnam];
-    std::tmpnam(tmpName);
-    const std::string fullCmd = cmd + " > \"" + tmpName + "\" 2>&1";
+    std::string fullCmd = cmd + " 2>&1";
     std::cout << "[exec] full cmd: " << fullCmd << '\n';
 
-    const int rc = std::system(fullCmd.c_str());
+    FILE* pipe = _popen(fullCmd.c_str(), "r");
+    if (!pipe)
+        return "[exec] _popen failed: "s + std::strerror(errno);
 
-    std::ifstream ifs(tmpName, std::ios::binary);
-    std::string out((std::istreambuf_iterator<char>(ifs)),
-                     std::istreambuf_iterator<char>());
-    std::remove(tmpName);
+    std::string out;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe))
+        out += buf;
 
+    const int rc = _pclose(pipe);
     out += "\n[exec] rc=" + std::to_string(rc);
-    if (rc != 0) {
-        out += "  errno=" + std::to_string(errno) +
-               " (" + std::string(strerror(errno)) + ")";
-    }
     return out;
 }
 
 // ------------------------------------------------------------------+
 extern "C" {
 
-//--- ICInfo / ICLocate остаются без изменений --------------------------------
+//--- ICInfo / ICLocate без изменений -----------------------------------------
 BOOL VFWAPI ICInfo(DWORD, DWORD, ICINFO* lpicinfo)
 {
     if (!lpicinfo) return FALSE;
@@ -84,13 +86,12 @@ BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn)
 {
     std::cout << "[ICSeqCompressFrameStart]\n";
 
-    auto ctx      = new CodecContext{};
-    ctx->width    = lpbiIn->bmiHeader.biWidth;
-    ctx->height   = lpbiIn->bmiHeader.biHeight;
-    ctx->outBuf.resize(1024 * 1024);               // стартовый 1 MiB
+    auto ctx   = new CodecContext{};
+    ctx->width  = lpbiIn->bmiHeader.biWidth;
+    ctx->height = lpbiIn->bmiHeader.biHeight;
+    ctx->outBuf.resize(1024 * 1024);                 // стартовый объём 1 MiB
 
-    // Рабочая папка (остаётся прежней – поменяем позже, если нужно)
-    ctx->baseDir = L"C:\\dmitrienkomy\\python";
+    ctx->baseDir = L"C:\\dmitrienkomy\\python";      // пока оставляем фиксированно
     std::error_code ec;
     std::filesystem::create_directories(ctx->baseDir, ec);
     if (ec)
@@ -112,7 +113,7 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
     const auto inFile  = ctx->baseDir / L"in.raw";
     const auto outFile = ctx->baseDir / L"out.mkv";
 
-    // 1) dump incoming frame --------------------------------------------------
+    // 1) сохраняем кадр -------------------------------------------------------
     {
         std::ofstream ofs(inFile, std::ios::binary);
         ofs.write(static_cast<char*>(lpBits),
@@ -120,11 +121,12 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
                   static_cast<std::streamsize>(ctx->height) * 6);
     }
 
-    // 2) build & run FFmpeg ---------------------------------------------------
+    // 2) собираем и запускаем FFmpeg -----------------------------------------
     const std::wstring ffmpegPath =
         L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
 
-    std::wcout << L"[Compress] FFmpeg " << (std::filesystem::exists(ffmpegPath) ? L"found" : L"NOT found")
+    std::wcout << L"[Compress] FFmpeg "
+               << (std::filesystem::exists(ffmpegPath) ? L"found" : L"NOT found")
                << L" at " << ffmpegPath << L'\n';
 
     std::wstringstream ss;
@@ -136,12 +138,11 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
        << L" \"" << outFile.wstring() << L"\"";
 
     const std::string fullCmd = narrow(L"\"" + ffmpegPath + L"\" " + ss.str());
-    std::cout << "[Compress] run: " << fullCmd << '\n';
     std::cout << "[Compress] ---------- FFmpeg LOG BEGIN ----------\n"
               << exec(fullCmd)
               << "\n[Compress] ----------- FFmpeg LOG END -----------\n";
 
-    // 3) collect encoder output ----------------------------------------------
+    // 3) читаем результат -----------------------------------------------------
     if (!std::filesystem::exists(outFile)) {
         std::cerr << "[Compress] out.mkv not found\n";
         return nullptr;

@@ -8,17 +8,17 @@
 #include <filesystem>
 
 //------------------------------------------------------------------------------
-//  RAII-контекст кодека (жизненный цикл = ICSeqCompressFrameStart/End)
+//  RAII-контекст кодека
 //------------------------------------------------------------------------------
 struct CodecContext
 {
-    int                      width{};     // исходный кадр
+    int                      width{};
     int                      height{};
     std::vector<BYTE>        outBuf;      // буфер кодированного потока
     std::filesystem::path    baseDir;     // рабочая папка для *.raw / *.mkv
 };
 
-//------ VFW экспорт -----------------------------------------------------------
+//------- VFW экспорт ----------------------------------------------------------
 extern "C" {
     BOOL    VFWAPI ICInfo               (DWORD fccType, DWORD fccHandler, ICINFO *lpicinfo);
     HIC     VFWAPI ICLocate             (DWORD fccType, DWORD fccHandler,
