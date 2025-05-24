@@ -1,6 +1,9 @@
 #include "vfw_wrapper.h"
+#include <sstream>
 #include <stdexcept>
+#include <cstring>
 
+// --- FFmpegProcess implementation ---
 FFmpegProcess::FFmpegProcess(const std::wstring& ffmpegPath)
     : ffmpegPath_(ffmpegPath), hProcess_(NULL), hStdinWrite_(NULL), hStdoutRead_(NULL) {}
 
@@ -9,24 +12,24 @@ FFmpegProcess::~FFmpegProcess() {
 }
 
 bool FFmpegProcess::start(const std::wstring& args) {
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    SECURITY_ATTRIBUTES sa{sizeof(sa), NULL, TRUE};
     HANDLE hStdinRead = NULL;
     HANDLE hStdoutWrite = NULL;
     if (!CreatePipe(&hStdinRead, &hStdinWrite_, &sa, 0) ||
         !CreatePipe(&hStdoutRead_, &hStdoutWrite, &sa, 0)) {
         return false;
     }
-
-    PROCESS_INFORMATION pi = {};
-    STARTUPINFOW si = {};
+    PROCESS_INFORMATION pi{};
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput  = hStdinRead;
     si.hStdOutput = hStdoutWrite;
     si.hStdError  = hStdoutWrite;
-
     std::wstring cmd = L"\"" + ffmpegPath_ + L"\" " + args;
     if (!CreateProcessW(NULL, &cmd[0], NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(hStdinRead);
+        CloseHandle(hStdoutWrite);
         return false;
     }
     CloseHandle(hStdinRead);
@@ -37,52 +40,97 @@ bool FFmpegProcess::start(const std::wstring& args) {
 }
 
 void FFmpegProcess::stop() {
+    if (hStdinWrite_) { CloseHandle(hStdinWrite_); hStdinWrite_ = NULL; }
     if (hProcess_) {
-        TerminateProcess(hProcess_, 0);
+        WaitForSingleObject(hProcess_, INFINITE);
         CloseHandle(hProcess_);
         hProcess_ = NULL;
     }
-    if (hStdinWrite_)  { CloseHandle(hStdinWrite_); hStdinWrite_ = NULL; }
     if (hStdoutRead_) { CloseHandle(hStdoutRead_); hStdoutRead_ = NULL; }
 }
 
-HANDLE FFmpegProcess::inputPipe()  { return hStdinWrite_; }
-HANDLE FFmpegProcess::outputPipe() { return hStdoutRead_; }
+HANDLE FFmpegProcess::inputPipe()  const { return hStdinWrite_; }
+HANDLE FFmpegProcess::outputPipe() const { return hStdoutRead_; }
 
-// Stub implementations for VFW exports
+// --- VFW plugin implementation ---
 extern "C" {
 
-WINBOOL WINAPI ICInfo(DWORD fccType, DWORD fccHandler, ICINFO* lpicinfo) {
-    // TODO: fill lpicinfo with codec metadata
+BOOL VFWAPI ICInfo(DWORD fccType, DWORD fccHandler, ICINFO* lpicinfo) {
+    if (!lpicinfo) return FALSE;
+    ZeroMemory(lpicinfo, sizeof(ICINFO));
+    lpicinfo->dwSize     = sizeof(ICINFO);
+    lpicinfo->fccType    = ICTYPE_VIDEO;
+    lpicinfo->fccHandler = mmioFOURCC('J','X','S','F');
+    lpicinfo->dwFlags    = 0; // support compression
+    lpicinfo->dwVersion  = 1;
+    lpicinfo->szName[0]  = '\0';
+    lpicinfo->szDescription[0] = '\0';
     return TRUE;
 }
 
-HIC WINAPI ICLocate(DWORD fccType, DWORD fccHandler,
+HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
                      LPBITMAPINFOHEADER lpbiIn,
                      LPBITMAPINFOHEADER lpbiOut,
                      WORD wFlags) {
-    // TODO: match fccType/fccHandler and return handle/context
-    return reinterpret_cast<HIC>(1);
+    if (fccType != ICTYPE_VIDEO || fccHandler != mmioFOURCC('J','X','S','F'))
+        return NULL;
+    if (lpbiIn->biCompression != BI_RGB || lpbiIn->biBitCount != 24)
+        return NULL;
+    lpbiOut->biSize        = sizeof(BITMAPINFOHEADER);
+    lpbiOut->biWidth       = lpbiIn->biWidth;
+    lpbiOut->biHeight      = lpbiIn->biHeight;
+    lpbiOut->biPlanes      = 1;
+    lpbiOut->biBitCount    = 24;
+    lpbiOut->biCompression = mmioFOURCC('M','J','P','G');
+    lpbiOut->biSizeImage   = 0;
+    CodecContext* ctx = new CodecContext;
+    ctx->proc         = nullptr;
+    ctx->width        = lpbiIn->biWidth;
+    ctx->height       = lpbiIn->biHeight;
+    ctx->outBufSize   = 1024*1024;
+    ctx->outBuf       = new BYTE[ctx->outBufSize];
+    return reinterpret_cast<HIC>(ctx);
 }
 
-WINBOOL WINAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn) {
-    // TODO: initialize compression sequence
-    return TRUE;
+BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn) {
+    CodecContext* ctx = reinterpret_cast<CodecContext*>(pc->lpState);
+    if (!ctx) return FALSE;
+    std::wstringstream ss;
+    ss << L"-f rawvideo -pix_fmt bgr24 -s " << ctx->width << L"x" << ctx->height
+       << L" -i pipe:0 -vcodec mjpeg -f avi pipe:1 -nostdin -hide_banner";
+    ctx->proc = new FFmpegProcess(L"/c/dmitrienkomy/cpp/jxs_ffmpeg/install-dir/bin/ffmpeg.exe");
+    return ctx->proc->start(ss.str());
 }
 
-LPVOID WINAPI ICSeqCompressFrame(PCOMPVARS pc,
+LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
                                  UINT uiFlags,
                                  LPVOID lpBits,
-                                 WINBOOL* pfKey,
+                                 BOOL* pfKey,
                                  LONG* plSize) {
-    // TODO: send raw frame via FFmpegProcess, read compressed data
+    CodecContext* ctx = reinterpret_cast<CodecContext*>(pc->lpState);
+    if (!ctx || !ctx->proc) return NULL;
+    DWORD inSize = ctx->width * ctx->height * 3;
+    DWORD written;
+    if (!WriteFile(ctx->proc->inputPipe(), lpBits, inSize, &written, NULL))
+        return NULL;
+    DWORD readBytes;
+    if (!ReadFile(ctx->proc->outputPipe(), ctx->outBuf, ctx->outBufSize, &readBytes, NULL))
+        return NULL;
     *pfKey = TRUE;
-    *plSize = 0;
-    return nullptr;
+    *plSize = readBytes;
+    return ctx->outBuf;
 }
 
-void WINAPI ICSeqCompressFrameEnd(PCOMPVARS pc) {
-    // TODO: finalize sequence
+void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc) {
+    CodecContext* ctx = reinterpret_cast<CodecContext*>(pc->lpState);
+    if (!ctx) return;
+    if (ctx->proc) {
+        ctx->proc->stop();
+        delete ctx->proc;
+    }
+    if (ctx->outBuf) delete[] ctx->outBuf;
+    delete ctx;
+    pc->lpState = 0;
 }
 
 } // extern C
