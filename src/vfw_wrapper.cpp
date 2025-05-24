@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <cstring>
 #include <string>
 using namespace std::string_literals;
 // ------------------------------------------------------------------+
@@ -25,18 +26,27 @@ static std::string narrow(const std::wstring &ws) {
 // Полный захват stdout+stderr внешней команды ― «auto exec = …»
 static std::string exec(const std::string &cmd)
 {
+    std::cout << "[exec] raw cmd: " << cmd << '\n';
+
     char tmpName[L_tmpnam];
-    std::tmpnam(tmpName);                     // имя временного файла
+    std::tmpnam(tmpName);
 
     const std::string fullCmd = cmd + " > \"" + tmpName + "\" 2>&1";
+    std::cout << "[exec] full cmd (with redirection): " << fullCmd << '\n';
+
     const int rc = std::system(fullCmd.c_str());
 
     std::ifstream ifs(tmpName, std::ios::binary);
     std::string out((std::istreambuf_iterator<char>(ifs)),
-                    std::istreambuf_iterator<char>());
-    std::remove(tmpName);                     // чистим лог-файл
+                     std::istreambuf_iterator<char>());
+    std::remove(tmpName);
 
     out += "\n[exec] rc=" + std::to_string(rc);
+    if (rc != 0) {
+        // strerror в глобальном пространстве имён
+        out += "  errno=" + std::to_string(errno) +
+               " (" + std::string(strerror(errno)) + ")";
+    }
     return out;
 }
 
@@ -104,6 +114,7 @@ BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn) {
     return TRUE;
 }
 
+// ------------------------------------------------------------------+
 LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
                                  UINT /*uiFlags*/,
                                  LPVOID lpBits,
@@ -116,16 +127,34 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
     const auto inFile  = ctx->tempDir / L"in.raw";
     const auto outFile = ctx->tempDir / L"out.jxs";
 
-    // 1) сохраняем входной кадр
+    // 0) диагностическая информация о среде
+    {
+        wchar_t cwd[MAX_PATH]{};
+        GetCurrentDirectoryW(MAX_PATH, cwd);
+        std::wcout << L"[ICSeqCompressFrame] CWD: " << cwd << L'\n';
+
+        if (auto pathEnv = _wgetenv(L"PATH"))
+            std::wcout << L"[ICSeqCompressFrame] PATH=" << pathEnv << L'\n';
+    }
+
+    // 1) сохраняем входной кадр ------------------------------------------------
     {
         std::ofstream ofs(inFile, std::ios::binary);
         ofs.write(reinterpret_cast<char *>(lpBits),
                   ctx->width * ctx->height * 3);
     }
 
-    // 2) формируем команду FFmpeg
+    // 2) формируем команду FFmpeg ---------------------------------------------
     const std::wstring ffmpegPath =
         L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
+
+    if (!std::filesystem::exists(ffmpegPath)) {
+        std::wcerr << L"[ICSeqCompressFrame] FFmpeg NOT found at "
+                   << ffmpegPath << L'\n';
+    } else {
+        std::wcout << L"[ICSeqCompressFrame] FFmpeg found at "
+                   << ffmpegPath << L'\n';
+    }
 
     std::wstringstream ss;
     ss << L"-y"
@@ -137,7 +166,6 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
        << L" -bpp 1.25"
        << L" \"" << outFile.wstring() << L"\"";
 
-    // БЕЗ второго 2>&1 — exec сам всё перенаправит
     const std::string fullCmd = narrow(L"\"" + ffmpegPath + L"\" " + ss.str());
 
     std::cout << "[ICSeqCompressFrame] run: " << fullCmd << '\n';
@@ -146,7 +174,7 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
               << ffmpegLog
               << "\n[ICSeqCompressFrame] ----------- FFmpeg LOG END -----------\n";
 
-    // 3) проверяем результат
+    // 3) проверяем результат ---------------------------------------------------
     if (!std::filesystem::exists(outFile)) {
         std::cerr << "[ICSeqCompressFrame] out.jxs not found\n";
         return nullptr;
@@ -159,6 +187,7 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
         delete[] ctx->outBuf;
         ctx->outBufSize = size;
         ctx->outBuf = new BYTE[size];
+        std::cout << "[ICSeqCompressFrame] realloc outBuf to " << size << " bytes\n";
     }
     ifs.read(reinterpret_cast<char *>(ctx->outBuf), size);
 
