@@ -127,9 +127,9 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
     if (!ctx) return nullptr;
 
     const auto inFile  = ctx->baseDir / L"in.raw";
-    const auto outFile = ctx->baseDir / L"out.jxs";
+    const auto outFile = ctx->baseDir / L"out.mkv";
 
-    // 0) диагностическая информация о среде
+    // 0) some diagnostics
     {
         wchar_t cwd[MAX_PATH]{};
         GetCurrentDirectoryW(MAX_PATH, cwd);
@@ -139,14 +139,16 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
             std::wcout << L"[ICSeqCompressFrame] PATH=" << pathEnv << L'\n';
     }
 
-    // 1) сохраняем входной кадр ------------------------------------------------
+    // 1) dump the incoming frame  --------------------------------------------
+    // gbrp12le  = planar, 12-bit → 2 bytes/component → 6 bytes/pixel
     {
         std::ofstream ofs(inFile, std::ios::binary);
         ofs.write(reinterpret_cast<char *>(lpBits),
-                  ctx->width * ctx->height * 3);
+                  static_cast<std::streamsize>(ctx->width) *
+                  static_cast<std::streamsize>(ctx->height) * 6);
     }
 
-    // 2) формируем команду FFmpeg ---------------------------------------------
+    // 2) build & run FFmpeg command ------------------------------------------
     const std::wstring ffmpegPath =
         L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
 
@@ -161,7 +163,7 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
     std::wstringstream ss;
     ss << L"-y"
        << L" -f rawvideo"
-       << L" -pix_fmt bgr24"
+       << L" -pix_fmt gbrp12le"                        // <-- changed here
        << L" -s:v " << ctx->width << L"x" << ctx->height
        << L" -i \"" << inFile.wstring() << L"\""
        << L" -c:v libsvtjpegxs"
@@ -176,7 +178,7 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
               << ffmpegLog
               << "\n[ICSeqCompressFrame] ----------- FFmpeg LOG END -----------\n";
 
-    // 3) проверяем результат ---------------------------------------------------
+    // 3) collect the encoder output ------------------------------------------
     if (!std::filesystem::exists(outFile)) {
         std::cerr << "[ICSeqCompressFrame] out.jxs not found\n";
         return nullptr;
@@ -189,7 +191,8 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
         delete[] ctx->outBuf;
         ctx->outBufSize = size;
         ctx->outBuf = new BYTE[size];
-        std::cout << "[ICSeqCompressFrame] realloc outBuf to " << size << " bytes\n";
+        std::cout << "[ICSeqCompressFrame] realloc outBuf to "
+                  << size << " bytes\n";
     }
     ifs.read(reinterpret_cast<char *>(ctx->outBuf), size);
 
