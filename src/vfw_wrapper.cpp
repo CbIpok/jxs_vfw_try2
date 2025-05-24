@@ -1,4 +1,3 @@
-//------C:\Users\dmitrienko\CLionProjects\untitled\src\vfw_wrapper.cpp-------//
 #include "vfw_wrapper.h"
 
 #include <fstream>
@@ -8,19 +7,39 @@
 #include <cstring>
 #include <cstdio>     // _popen / _pclose
 #include <cerrno>
+#include <cstdlib>    // _wgetenv
 
 using namespace std::string_literals;
+
+//------------------------------------------------------------------------------
+// Глобальные (настраиваемые) пути + авто-инициализация из переменных среды
+//------------------------------------------------------------------------------
+namespace {
+std::filesystem::path g_baseDir    = L"C:\\dmitrienkomy\\python";
+std::filesystem::path g_ffmpegPath = L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
+
+void initPathsFromEnv()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    if (const wchar_t* env = _wgetenv(L"JXS_VFW_BASEDIR"); env && *env)
+        g_baseDir = env;
+
+    if (const wchar_t* env = _wgetenv(L"JXS_VFW_FFMPEG"); env && *env)
+        g_ffmpegPath = env;
+}
+} // namespace
 
 // ------------------------------------------------------------------+
 // UTF-16 → UTF-8
 static std::string narrow(const std::wstring& ws)
 {
     if (ws.empty()) return {};
-    int n = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1,
-                                  nullptr, 0, nullptr, nullptr);
+    int n = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
     std::string out(n - 1, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1,
-                          out.data(), n, nullptr, nullptr);
+    ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), n, nullptr, nullptr);
     return out;
 }
 
@@ -48,7 +67,7 @@ static std::string exec(const std::string& cmd)
 // ------------------------------------------------------------------+
 extern "C" {
 
-//--- ICInfo / ICLocate без изменений -----------------------------------------
+//— ICInfo / ICLocate остаются без изменений —----------------------------------
 BOOL VFWAPI ICInfo(DWORD, DWORD, ICINFO* lpicinfo)
 {
     if (!lpicinfo) return FALSE;
@@ -85,13 +104,14 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
 BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn)
 {
     std::cout << "[ICSeqCompressFrameStart]\n";
+    initPathsFromEnv();
 
     auto ctx   = new CodecContext{};
     ctx->width  = lpbiIn->bmiHeader.biWidth;
     ctx->height = lpbiIn->bmiHeader.biHeight;
     ctx->outBuf.resize(1024 * 1024);                 // стартовый объём 1 MiB
 
-    ctx->baseDir = L"C:\\dmitrienkomy\\python";      // пока оставляем фиксированно
+    ctx->baseDir = g_baseDir;                        // <- теперь настраиваемо
     std::error_code ec;
     std::filesystem::create_directories(ctx->baseDir, ec);
     if (ec)
@@ -107,6 +127,7 @@ BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn)
 LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
                                  BOOL* pfKey, LONG* plSize)
 {
+    initPathsFromEnv();
     auto ctx = reinterpret_cast<CodecContext*>(pc->lpState);
     if (!ctx) return nullptr;
 
@@ -122,12 +143,9 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
     }
 
     // 2) собираем и запускаем FFmpeg -----------------------------------------
-    const std::wstring ffmpegPath =
-        L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
-
     std::wcout << L"[Compress] FFmpeg "
-               << (std::filesystem::exists(ffmpegPath) ? L"found" : L"NOT found")
-               << L" at " << ffmpegPath << L'\n';
+               << (std::filesystem::exists(g_ffmpegPath) ? L"found" : L"NOT found")
+               << L" at " << g_ffmpegPath << L'\n';
 
     std::wstringstream ss;
     ss << L"-y -f rawvideo"
@@ -137,7 +155,7 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
        << L" -c:v libsvtjpegxs -bpp 1.25"
        << L" \"" << outFile.wstring() << L"\"";
 
-    const std::string fullCmd = narrow(L"\"" + ffmpegPath + L"\" " + ss.str());
+    const std::string fullCmd = narrow(L"\"" + g_ffmpegPath.wstring() + L"\" " + ss.str());
     std::cout << "[Compress] ---------- FFmpeg LOG BEGIN ----------\n"
               << exec(fullCmd)
               << "\n[Compress] ----------- FFmpeg LOG END -----------\n";
@@ -172,7 +190,21 @@ void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc)
     pc->lpState = nullptr;
 }
 
+//— новые экспортируемые функции —---------------------------------------------
+void WINAPI JXSVFW_SetBaseDir(const wchar_t* dir)
+{
+    if (dir && *dir)
+        g_baseDir = dir;
+}
+
+void WINAPI JXSVFW_SetFFmpegPath(const wchar_t* path)
+{
+    if (path && *path)
+        g_ffmpegPath = path;
+}
+
 STDAPI DllRegisterServer()   { return S_OK; }
 STDAPI DllUnregisterServer() { return S_OK; }
 
 } // extern "C"
+//---------------------------------------------------------------------------//
