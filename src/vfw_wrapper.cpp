@@ -1,56 +1,92 @@
+// src/vfw_wrapper.cpp
 #include "vfw_wrapper.h"
 #include <sstream>
-#include <cstring>
+#include <iostream>
 
 // — FFmpegProcess —
 
 FFmpegProcess::FFmpegProcess(const std::wstring &ffmpegPath)
-  : ffmpegPath_(ffmpegPath), hProcess_(NULL),
-    hStdinWrite_(NULL), hStdoutRead_(NULL) {}
+  : ffmpegPath_(ffmpegPath),
+    hProcess_(NULL),
+    hStdinWrite_(NULL),
+    hStdoutRead_(NULL)
+{}
 
 FFmpegProcess::~FFmpegProcess() {
     stop();
 }
 
 bool FFmpegProcess::start(const std::wstring &args) {
+    // Create pipes for stdin/stdout
     SECURITY_ATTRIBUTES sa{ sizeof(sa), NULL, TRUE };
-    HANDLE hStdinRead = NULL, hStdoutWrite = NULL;
+    HANDLE hStdinRead  = NULL;
+    HANDLE hStdoutWrite = NULL;
+
     if (!CreatePipe(&hStdinRead, &hStdinWrite_, &sa, 0) ||
         !CreatePipe(&hStdoutRead_, &hStdoutWrite, &sa, 0)) {
+        std::cerr << "Failed to create pipes\n";
         return false;
     }
 
     PROCESS_INFORMATION pi{};
     STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdInput  = hStdinRead;
-    si.hStdOutput = hStdoutWrite;
-    si.hStdError  = hStdoutWrite;
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES;
+    si.hStdInput   = hStdinRead;
+    si.hStdOutput  = hStdoutWrite;
+    si.hStdError   = hStdoutWrite;
 
-    std::wstring cmd = L"\"" + ffmpegPath_ + L"\" " + args;
-    if (!CreateProcessW(NULL, &cmd[0], NULL, NULL, TRUE,
-                        0, NULL, NULL, &si, &pi)) {
+    // Build a mutable command-line buffer
+    std::wstring cmdLine = L"\"";
+    cmdLine += ffmpegPath_;
+    cmdLine += L"\" ";
+    cmdLine += args;
+
+    // Launch ffmpeg:
+    if (!CreateProcessW(
+            ffmpegPath_.c_str(),  // explicit application name
+            &cmdLine[0],          // command-line (must be writable)
+            NULL, NULL,
+            TRUE,                 // inherit handles
+            0,                    // no special flags
+            NULL, NULL,           // env + cwd
+            &si,
+            &pi
+        ))
+    {
+        DWORD err = GetLastError();
+        std::cerr << "CreateProcessW failed, error=" << err << "\n";
         CloseHandle(hStdinRead);
         CloseHandle(hStdoutWrite);
         return false;
     }
 
+    // We don't need these in the parent
     CloseHandle(hStdinRead);
     CloseHandle(hStdoutWrite);
+
     hProcess_ = pi.hProcess;
     CloseHandle(pi.hThread);
     return true;
 }
 
 void FFmpegProcess::stop() {
-    if (hStdinWrite_) { CloseHandle(hStdinWrite_);  hStdinWrite_ = NULL; }
-    if (hProcess_)    { WaitForSingleObject(hProcess_, INFINITE);
-                        CloseHandle(hProcess_);     hProcess_ = NULL; }
-    if (hStdoutRead_) { CloseHandle(hStdoutRead_);  hStdoutRead_ = NULL; }
+    if (hStdinWrite_) {
+        CloseHandle(hStdinWrite_);
+        hStdinWrite_ = NULL;
+    }
+    if (hProcess_) {
+        WaitForSingleObject(hProcess_, INFINITE);
+        CloseHandle(hProcess_);
+        hProcess_ = NULL;
+    }
+    if (hStdoutRead_) {
+        CloseHandle(hStdoutRead_);
+        hStdoutRead_ = NULL;
+    }
 }
 
-HANDLE FFmpegProcess::inputPipe() const  { return hStdinWrite_; }
+HANDLE FFmpegProcess::inputPipe()  const { return hStdinWrite_; }
 HANDLE FFmpegProcess::outputPipe() const { return hStdoutRead_; }
 
 
@@ -61,11 +97,11 @@ extern "C" {
 BOOL VFWAPI ICInfo(DWORD fccType, DWORD fccHandler, ICINFO *lpicinfo) {
     if (!lpicinfo) return FALSE;
     ZeroMemory(lpicinfo, sizeof(ICINFO));
-    lpicinfo->dwSize      = sizeof(ICINFO);
-    lpicinfo->fccType     = ICTYPE_VIDEO;
-    lpicinfo->fccHandler  = mmioFOURCC('J','X','S','F');
-    lpicinfo->dwFlags     = 0;
-    lpicinfo->dwVersion   = 1;
+    lpicinfo->dwSize     = sizeof(ICINFO);
+    lpicinfo->fccType    = ICTYPE_VIDEO;
+    lpicinfo->fccHandler = mmioFOURCC('J','X','S','F');
+    lpicinfo->dwFlags    = 0;
+    lpicinfo->dwVersion  = 1;
     lpicinfo->szName[0]       =
     lpicinfo->szDescription[0] = '\0';
     return TRUE;
@@ -76,26 +112,23 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
                     LPBITMAPINFOHEADER lpbiOut,
                     WORD wFlags)
 {
-    // host is just enumerating codecs?
     if ((wFlags & ICMODE_COMPRESS) &&
         lpbiIn  == nullptr &&
         lpbiOut == nullptr)
     {
-        // we exist — return any nonzero handle
+        // Enumerator ping
         return reinterpret_cast<HIC>(1);
     }
 
-    // otherwise only claim if they ask for our FOURCC on video
     if (fccType    != ICTYPE_VIDEO ||
         fccHandler != mmioFOURCC('J','X','S','F'))
         return NULL;
 
-    // input must be 24-bit RGB
     if (lpbiIn->biCompression != BI_RGB ||
         lpbiIn->biBitCount   != 24)
         return NULL;
 
-    // advertise MJPEG output
+    // Advertise MJPEG
     lpbiOut->biSize        = sizeof(BITMAPINFOHEADER);
     lpbiOut->biWidth       = lpbiIn->biWidth;
     lpbiOut->biHeight      = lpbiIn->biHeight;
@@ -108,23 +141,23 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
 }
 
 BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn) {
-    // allocate and stash our per-stream context here
     CodecContext* ctx = new CodecContext;
     ctx->width      = lpbiIn->bmiHeader.biWidth;
     ctx->height     = lpbiIn->bmiHeader.biHeight;
     ctx->outBufSize = 1024 * 1024;
     ctx->outBuf     = new BYTE[ctx->outBufSize];
-    pc->lpState     = reinterpret_cast<LPVOID>(ctx);  // <<-- fixed cast
+    pc->lpState     = ctx;
 
-    // build & launch FFmpeg
+    // Build ffmpeg arguments
     std::wstringstream ss;
     ss << L"-f rawvideo -pix_fmt bgr24 -s "
        << ctx->width << L"x" << ctx->height
        << L" -i pipe:0 -vcodec mjpeg -f avi pipe:1 "
           L"-nostdin -hide_banner";
 
+    // NOTE: Update this path to where *your* ffmpeg.exe lives:
     ctx->proc = new FFmpegProcess(
-        L"/c/dmitrienkomy/cpp/jxs_ffmpeg/install-dir/bin/ffmpeg.exe"
+        L"C:/dmitrienkomy/cpp/jxs_ffmpeg/install-dir/bin/ffmpeg.exe"
     );
     return ctx->proc->start(ss.str());
 }
@@ -136,7 +169,8 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
                                  LONG *plSize)
 {
     auto ctx = reinterpret_cast<CodecContext*>(pc->lpState);
-    if (!ctx || !ctx->proc) return NULL;
+    if (!ctx || !ctx->proc)
+        return NULL;
 
     DWORD inSize = ctx->width * ctx->height * 3;
     DWORD written;
@@ -163,7 +197,7 @@ void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc) {
     }
     delete[] ctx->outBuf;
     delete ctx;
-    pc->lpState = nullptr;  // clear it
+    pc->lpState = nullptr;
 }
 
 STDAPI DllRegisterServer()   { return S_OK; }
