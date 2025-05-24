@@ -1,131 +1,29 @@
-#include "vfw_wrapper.h"
+// vfw_wrapper.cpp
+#include <windows.h>
+#include <vfw.h>
+#include <string>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <iostream>
 
-//
-// — FFmpegProcess —
-//
-
-FFmpegProcess::FFmpegProcess(const std::wstring &ffmpegPath)
-  : ffmpegPath_(ffmpegPath),
-    hProcess_(NULL),
-    hStdinWrite_(NULL),
-    hStdoutRead_(NULL)
-{
-    std::wcout << L"[FFmpegProcess] ctor, path=" << ffmpegPath_ << L"\n";
-}
-
-FFmpegProcess::~FFmpegProcess() {
-    std::cout << "[FFmpegProcess] destructor\n";
-    stop();
-}
-
-bool FFmpegProcess::start(const std::wstring &args) {
-    std::wcout << L"[FFmpegProcess] start(), args=" << args << L"\n";
-
-    // Create pipes for stdin/stdout
-    SECURITY_ATTRIBUTES sa{ sizeof(sa), NULL, TRUE };
-    HANDLE hStdinRead  = NULL;
-    HANDLE hStdoutWrite = NULL;
-
-    if (!CreatePipe(&hStdinRead, &hStdinWrite_, &sa, 0) ||
-        !CreatePipe(&hStdoutRead_, &hStdoutWrite, &sa, 0)) {
-        DWORD err = GetLastError();
-        std::cerr << "[FFmpegProcess] CreatePipe failed, err=" << err << "\n";
-        return false;
-    }
-    std::cout << "[FFmpegProcess] pipes created\n";
-
-    PROCESS_INFORMATION pi{};
-    STARTUPINFOW si{};
-    si.cb          = sizeof(si);
-    si.dwFlags     = STARTF_USESTDHANDLES;
-    si.hStdInput   = hStdinRead;
-    si.hStdOutput  = hStdoutWrite;
-    si.hStdError   = hStdoutWrite;
-
-    // Build a mutable command-line buffer
-    std::wstring cmdLine = L"\"";
-    cmdLine += ffmpegPath_;
-    cmdLine += L"\" ";
-    cmdLine += args;
-    std::wcout << L"[FFmpegProcess] CmdLine=\"" << cmdLine << L"\"\n";
-
-    // Launch ffmpeg:
-    if (!CreateProcessW(
-            ffmpegPath_.c_str(),
-            &cmdLine[0],
-            NULL, NULL,
-            TRUE,
-            0,
-            NULL, NULL,
-            &si,
-            &pi
-        ))
-    {
-        DWORD err = GetLastError();
-        std::cerr << "[FFmpegProcess] CreateProcessW failed, err=" << err << "\n";
-        CloseHandle(hStdinRead);
-        CloseHandle(hStdoutWrite);
-        return false;
-    }
-
-    std::cout << "[FFmpegProcess] process started, PID=" << pi.dwProcessId << "\n";
-    // We don't need these in the parent
-    CloseHandle(hStdinRead);
-    CloseHandle(hStdoutWrite);
-
-    hProcess_ = pi.hProcess;
-    CloseHandle(pi.hThread);
-    return true;
-}
-
-void FFmpegProcess::stop() {
-    std::cout << "[FFmpegProcess] stop()\n";
-    if (hStdinWrite_) {
-        std::cout << "[FFmpegProcess] closing stdin pipe\n";
-        CloseHandle(hStdinWrite_);
-        hStdinWrite_ = NULL;
-    }
-    if (hProcess_) {
-        std::cout << "[FFmpegProcess] waiting for process to exit\n";
-        WaitForSingleObject(hProcess_, INFINITE);
-        CloseHandle(hProcess_);
-        hProcess_ = NULL;
-    }
-    if (hStdoutRead_) {
-        std::cout << "[FFmpegProcess] closing stdout pipe\n";
-        CloseHandle(hStdoutRead_);
-        hStdoutRead_ = NULL;
-    }
-}
-
-HANDLE FFmpegProcess::inputPipe()  const { return hStdinWrite_; }
-HANDLE FFmpegProcess::outputPipe() const { return hStdoutRead_; }
-
-
-//
-// — VFW Callbacks —
-//
+struct CodecContext {
+    int width;
+    int height;
+    size_t outBufSize;
+    BYTE* outBuf;
+    std::filesystem::path tempDir;
+};
 
 extern "C" {
 
+// Оставляем ICInfo/ICLocate без изменений:
 BOOL VFWAPI ICInfo(DWORD fccType, DWORD fccHandler, ICINFO *lpicinfo) {
-    std::cout << "[ICInfo] called, fccType=" << fccType
-              << " fccHandler=" << fccHandler << "\n";
-    if (!lpicinfo) {
-        std::cerr << "[ICInfo] bad pointer\n";
-        return FALSE;
-    }
-    ZeroMemory(lpicinfo, sizeof(ICINFO));
+    if (!lpicinfo) return FALSE;
+    ZeroMemory(lpicinfo, sizeof(*lpicinfo));
     lpicinfo->dwSize     = sizeof(ICINFO);
     lpicinfo->fccType    = ICTYPE_VIDEO;
     lpicinfo->fccHandler = mmioFOURCC('J','X','S','F');
-    lpicinfo->dwFlags    = 0;
-    lpicinfo->dwVersion  = 1;
-    lpicinfo->szName[0]       =
-    lpicinfo->szDescription[0]= '\0';
-    std::cout << "[ICInfo] filling out info OK\n";
     return TRUE;
 }
 
@@ -134,31 +32,12 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
                     LPBITMAPINFOHEADER lpbiOut,
                     WORD wFlags)
 {
-    std::cout << "[ICLocate] called, fccType=" << fccType
-              << " fccHandler=" << fccHandler
-              << " wFlags=" << wFlags << "\n";
-
-    if ((wFlags & ICMODE_COMPRESS) &&
-        lpbiIn  == nullptr &&
-        lpbiOut == nullptr)
-    {
-        std::cout << "[ICLocate] enumeration ping\n";
+    if ((wFlags & ICMODE_COMPRESS) && !lpbiIn && !lpbiOut)
         return reinterpret_cast<HIC>(1);
-    }
-
-    if (fccType    != ICTYPE_VIDEO ||
-        fccHandler != mmioFOURCC('J','X','S','F')) {
-        std::cout << "[ICLocate] not our handler\n";
+    if (fccType!=ICTYPE_VIDEO || fccHandler!=mmioFOURCC('J','X','S','F'))
         return NULL;
-    }
-
-    if (lpbiIn->biCompression != BI_RGB ||
-        lpbiIn->biBitCount   != 24) {
-        std::cout << "[ICLocate] unsupported input format\n";
+    if (lpbiIn->biCompression!=BI_RGB || lpbiIn->biBitCount!=24)
         return NULL;
-    }
-
-    // Advertise MJPEG
     lpbiOut->biSize        = sizeof(BITMAPINFOHEADER);
     lpbiOut->biWidth       = lpbiIn->biWidth;
     lpbiOut->biHeight      = lpbiIn->biHeight;
@@ -166,103 +45,134 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
     lpbiOut->biBitCount    = 24;
     lpbiOut->biCompression = mmioFOURCC('M','J','P','G');
     lpbiOut->biSizeImage   = 0;
-
-    std::cout << "[ICLocate] returning dummy HIC\n";
     return reinterpret_cast<HIC>(1);
 }
 
 BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn) {
-    std::cout << "[ICSeqCompressFrameStart] called\n";
-    CodecContext* ctx = new CodecContext;
+    std::cout << "[ICSeqCompressFrameStart]\n";
+    auto ctx = new CodecContext;
     ctx->width      = lpbiIn->bmiHeader.biWidth;
     ctx->height     = lpbiIn->bmiHeader.biHeight;
-    ctx->outBufSize = 1024 * 1024;
+    ctx->outBufSize = 1024*1024;
     ctx->outBuf     = new BYTE[ctx->outBufSize];
-    pc->lpState     = ctx;
-    std::cout << "[ICSeqCompressFrameStart] ctx width=" << ctx->width
-              << " height=" << ctx->height << "\n";
-
-    // Build ffmpeg args to encode a single MJPEG frame
-    std::wstringstream ss;
-    ss << L"-f rawvideo -pix_fmt bgr24 -s "
-       << ctx->width << L"x" << ctx->height
-       << L" -i pipe:0"
-       << L" -vcodec mjpeg"    // MJPEG encoder
-       << L" -f mjpeg"         // raw MJPEG output
-       << L" -frames:v 1"      // exactly one frame
-       << L" pipe:1 -nostdin -hide_banner";
-    std::wcout << L"[ICSeqCompressFrameStart] ffmpeg args=" << ss.str() << L"\n";
-
-    // NOTE: adjust this path!
-    ctx->proc = new FFmpegProcess(
-        L"C:/dmitrienkomy/cpp/jxs_ffmpeg/install-dir/bin/ffmpeg.exe"
-    );
-    bool ok = ctx->proc->start(ss.str());
-    std::cout << "[ICSeqCompressFrameStart] FFmpegProcess::start() -> "
-              << (ok ? "SUCCESS" : "FAIL") << "\n";
-    return ok;
+    ctx->tempDir    = std::filesystem::temp_directory_path() / L"vfwffmpeg";
+    std::error_code ec;
+    std::filesystem::create_directories(ctx->tempDir, ec);
+    if (ec) {
+        std::cerr << "[ICSeqCompressFrameStart] cannot create temp dir: "
+                  << ec.message() << "\n";
+    } else {
+        std::cout << "[ICSeqCompressFrameStart] tempDir="
+                  << ctx->tempDir.u8string() << "\n";
+    }
+    pc->lpState = ctx;
+    return TRUE;
 }
 
 LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
-                                 UINT uiFlags,
+                                 UINT /*uiFlags*/,
                                  LPVOID lpBits,
                                  BOOL *pfKey,
                                  LONG *plSize)
 {
-    std::cout << "[ICSeqCompressFrame] called, uiFlags=" << uiFlags << "\n";
     auto ctx = reinterpret_cast<CodecContext*>(pc->lpState);
-    if (!ctx || !ctx->proc) {
-        std::cerr << "[ICSeqCompressFrame] no context or proc\n";
-        return NULL;
+    if (!ctx) return nullptr;
+
+    auto inFile  = ctx->tempDir / L"in.raw";
+    // Меняем расширение на .jxs
+    auto outFile = ctx->tempDir / L"out.jxs";
+
+    // 1) Записываем «сырой» BGR-фрейм
+    {
+        std::ofstream ofs(inFile, std::ios::binary);
+        ofs.write(reinterpret_cast<char*>(lpBits),
+                  ctx->width * ctx->height * 3);
     }
 
-    DWORD inSize = ctx->width * ctx->height * 3;
-    std::cout << "[ICSeqCompressFrame] writing " << inSize << " bytes to ffmpeg stdin\n";
-    DWORD written = 0;
-    if (!WriteFile(ctx->proc->inputPipe(), lpBits, inSize, &written, NULL)) {
+    // полный путь к ffmpeg.exe — обязательно с \\:
+    const std::wstring ffmpegPath =
+        L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
+    // папка с ним же, для текущей директории:
+    const std::wstring ffmpegDir =
+        std::filesystem::path(ffmpegPath).parent_path().wstring();
+
+    // 1) пишем in.raw как раньше…
+
+    // 2) собираем аргументы (только после имени, без кавычек вокруг пути):
+    std::wstringstream args;
+    args << L"-y"
+         << L" -f rawvideo"
+         << L" -pix_fmt bgr24"
+         << L" -s:v " << ctx->width << L"x" << ctx->height
+         << L" -i \"" << inFile.wstring() << L"\""
+         << L" -c:v libsvtjpegxs"
+         << L" -bpp 1.25"
+         << L" \"" << outFile.wstring() << L"\"";
+    std::wstring cmdLine = args.str();
+    std::wcout << L"[ICSeqCompressFrame] spawning: "
+               << ffmpegPath << L" " << cmdLine << L"\n";
+
+    // 3) запускаем:
+    STARTUPINFOW si{ sizeof(si) };
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(
+            ffmpegPath.c_str(),        // lpApplicationName
+            &cmdLine[0],               // lpCommandLine
+            nullptr, nullptr,          // security
+            FALSE,                     // inherit handles
+            CREATE_NO_WINDOW,          // flags
+            nullptr,                   // use current env (PATH не меняли)
+            ffmpegDir.c_str(),         // lpCurrentDirectory
+            &si, &pi))
+    {
         DWORD err = GetLastError();
-        std::cerr << "[ICSeqCompressFrame] WriteFile failed, err=" << err << "\n";
-        return NULL;
+        std::cerr << "[ICSeqCompressFrame] CreateProcessW failed, err="
+                  << err << "\n";
+        return nullptr;
     }
-    std::cout << "[ICSeqCompressFrame] wrote " << written << " bytes\n";
 
-    // Signal EOF so ffmpeg quits and flushes
-    std::cout << "[ICSeqCompressFrame] closing stdin to signal EOF\n";
-    CloseHandle(ctx->proc->inputPipe());
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    std::cout << "[ICSeqCompressFrame] ffmpeg exit code="
+              << exitCode << "\n";
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
 
-    // Now read the compressed JPEG
-    DWORD readBytes = 0;
-    std::cout << "[ICSeqCompressFrame] attempting ReadFile from ffmpeg stdout\n";
-    if (!ReadFile(ctx->proc->outputPipe(),
-                  ctx->outBuf, ctx->outBufSize, &readBytes, NULL)) {
-        DWORD err = GetLastError();
-        std::cerr << "[ICSeqCompressFrame] ReadFile failed, err=" << err << "\n";
-        return NULL;
+    // 4) Читаем полученный .jxs
+    if (!std::filesystem::exists(outFile)) {
+        std::cerr << "[ICSeqCompressFrame] out.jxs not found\n";
+        return nullptr;
     }
-    std::cout << "[ICSeqCompressFrame] read " << readBytes << " bytes\n";
+    std::ifstream ifs(outFile, std::ios::binary | std::ios::ate);
+    size_t size = static_cast<size_t>(ifs.tellg());
+    ifs.seekg(0);
+    if (size > ctx->outBufSize) {
+        delete[] ctx->outBuf;
+        ctx->outBufSize = size;
+        ctx->outBuf = new BYTE[size];
+    }
+    ifs.read(reinterpret_cast<char*>(ctx->outBuf), size);
 
     *pfKey  = TRUE;
-    *plSize = readBytes;
+    *plSize = static_cast<LONG>(size);
+    std::cout << "[ICSeqCompressFrame] compressed size=" << size << "\n";
     return ctx->outBuf;
 }
 
 void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc) {
-    std::cout << "[ICSeqCompressFrameEnd] called\n";
+    std::cout << "[ICSeqCompressFrameEnd]\n";
     auto ctx = reinterpret_cast<CodecContext*>(pc->lpState);
     if (!ctx) return;
 
-    if (ctx->proc) {
-        std::cout << "[ICSeqCompressFrameEnd] stopping process\n";
-        ctx->proc->stop();
-        delete ctx->proc;
-    }
     delete[] ctx->outBuf;
+    std::filesystem::remove(ctx->tempDir / L"in.raw");
+    std::filesystem::remove(ctx->tempDir / L"out.jpg");
     delete ctx;
     pc->lpState = nullptr;
-    std::cout << "[ICSeqCompressFrameEnd] cleanup done\n";
 }
 
-STDAPI DllRegisterServer()   { std::cout << "[DllRegisterServer]\n"; return S_OK; }
-STDAPI DllUnregisterServer() { std::cout << "[DllUnregisterServer]\n"; return S_OK; }
+STDAPI DllRegisterServer()   { return S_OK; }
+STDAPI DllUnregisterServer() { return S_OK; }
 
 } // extern "C"
