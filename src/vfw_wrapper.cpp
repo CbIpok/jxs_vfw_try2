@@ -7,10 +7,10 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
-#include <string>
 using namespace std::string_literals;
+
 // ------------------------------------------------------------------+
-// Узкий UTF-8 вариант из std::wstring  ➜  std::string
+// Узкий UTF‑8 вариант из std::wstring  ➜  std::string
 static std::string narrow(const std::wstring &ws) {
     if (ws.empty()) return {};
     int n = ::WideCharToMultiByte(CP_UTF8, 0,
@@ -23,7 +23,7 @@ static std::string narrow(const std::wstring &ws) {
     return out;
 }
 
-// Полный захват stdout+stderr внешней команды ― «auto exec = …»
+// Полный захват stdout + stderr внешней команды ― «auto exec = …»
 static std::string exec(const std::string &cmd)
 {
     std::cout << "[exec] raw cmd: " << cmd << '\n';
@@ -52,15 +52,13 @@ static std::string exec(const std::string &cmd)
 
 // ------------------------------------------------------------------+
 
-
 struct CodecContext {
-    int width;
-    int height;
-    size_t outBufSize;
-    BYTE *outBuf;
-    std::filesystem::path tempDir;
+    int width{};
+    int height{};
+    size_t outBufSize{};
+    BYTE *outBuf{};
+    std::filesystem::path baseDir;   // теперь всегда C:\dmitrienkomy\python
 };
-
 
 extern "C" {
 // Оставляем ICInfo/ICLocate без изменений:
@@ -95,21 +93,25 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
 
 BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn) {
     std::cout << "[ICSeqCompressFrameStart]\n";
+
     auto ctx = new CodecContext;
     ctx->width = lpbiIn->bmiHeader.biWidth;
     ctx->height = lpbiIn->bmiHeader.biHeight;
     ctx->outBufSize = 1024 * 1024;
     ctx->outBuf = new BYTE[ctx->outBufSize];
-    ctx->tempDir = std::filesystem::temp_directory_path() / L"vfwffmpeg";
+
+    // Постоянная директория для входных/выходных файлов
+    ctx->baseDir = L"C:\\dmitrienkomy\\python";
     std::error_code ec;
-    std::filesystem::create_directories(ctx->tempDir, ec);
+    std::filesystem::create_directories(ctx->baseDir, ec);
     if (ec) {
-        std::cerr << "[ICSeqCompressFrameStart] cannot create temp dir: "
-                << ec.message() << "\n";
+        std::cerr << "[ICSeqCompressFrameStart] cannot create base dir: "
+                  << ec.message() << "\n";
     } else {
-        std::cout << "[ICSeqCompressFrameStart] tempDir="
-                << ctx->tempDir.u8string() << "\n";
+        std::cout << "[ICSeqCompressFrameStart] baseDir="
+                  << ctx->baseDir.u8string() << "\n";
     }
+
     pc->lpState = ctx;
     return TRUE;
 }
@@ -124,8 +126,8 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc,
     auto ctx = reinterpret_cast<CodecContext *>(pc->lpState);
     if (!ctx) return nullptr;
 
-    const auto inFile  = ctx->tempDir / L"in.raw";
-    const auto outFile = ctx->tempDir / L"out.jxs";
+    const auto inFile  = ctx->baseDir / L"in.raw";
+    const auto outFile = ctx->baseDir / L"out.jxs";
 
     // 0) диагностическая информация о среде
     {
@@ -204,8 +206,10 @@ void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc)
     if (!ctx) return;
 
     delete[] ctx->outBuf;
-    std::filesystem::remove(ctx->tempDir / L"in.raw");
-    std::filesystem::remove(ctx->tempDir / L"out.jxs");   // ← было .jpg
+    // Больше не удаляем файлы in.raw/out.jxs — оставляем их в C:\dmitrienkomy\python
+    // std::filesystem::remove(ctx->baseDir / L"in.raw");
+    // std::filesystem::remove(ctx->baseDir / L"out.jxs");
+
     delete ctx;
     pc->lpState = nullptr;
 }
@@ -213,3 +217,4 @@ void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc)
 STDAPI DllRegisterServer() { return S_OK; }
 STDAPI DllUnregisterServer() { return S_OK; }
 } // extern "C"
+//---------------------------------------------------------------------------//
