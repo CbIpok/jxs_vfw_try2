@@ -74,27 +74,57 @@ BOOL VFWAPI ICInfo(DWORD fccType, DWORD fccHandler, ICINFO *lpicinfo) {
     return TRUE;
 }
 
-HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
-                    LPBITMAPINFOHEADER lpbiIn,
-                    LPBITMAPINFOHEADER lpbiOut,
-                    WORD wFlags) {
-    if (fccType != ICTYPE_VIDEO || fccHandler != mmioFOURCC('J', 'X', 'S', 'F'))
+
+    HIC VFWAPI ICLocate(
+        DWORD fccType,
+        DWORD fccHandler,
+        LPBITMAPINFOHEADER lpbiIn,
+        LPBITMAPINFOHEADER lpbiOut,
+        WORD wFlags)
+{
+    // 1) Если хост просто опрашивает, есть ли у нас кодек (enumeration),
+    //    то lpbiIn и lpbiOut равны nullptr, а в wFlags стоит ICMODE_COMPRESS.
+    //    В этом режиме возвращаем любое ненулевое HIC, не дергая lpbiIn/Out.
+    if ((wFlags & ICMODE_COMPRESS) &&
+        lpbiIn  == nullptr &&
+        lpbiOut == nullptr)
+    {
+        // Кодек есть, но контекст ещё не создаём
+        return reinterpret_cast<HIC>(1);
+    }
+
+    // 2) Дальше — реальный запрос с валидными lpbiIn и lpbiOut.
+    //    Сначала проверяем, что это видео и наш FOURCC "JXSF":
+    if (fccType    != ICTYPE_VIDEO ||
+        fccHandler != mmioFOURCC('J','X','S','F'))
+    {
         return NULL;
-    if (lpbiIn->biCompression != BI_RGB || lpbiIn->biBitCount != 24)
+    }
+
+    // 3) Проверяем, что входящий формат — ровно 24-битное RGB:
+    if (lpbiIn->biCompression != BI_RGB ||
+        lpbiIn->biBitCount   != 24)
+    {
         return NULL;
-    lpbiOut->biSize = sizeof(BITMAPINFOHEADER);
-    lpbiOut->biWidth = lpbiIn->biWidth;
-    lpbiOut->biHeight = lpbiIn->biHeight;
-    lpbiOut->biPlanes = 1;
-    lpbiOut->biBitCount = 24;
-    lpbiOut->biCompression = mmioFOURCC('M', 'J', 'P', 'G');
-    lpbiOut->biSizeImage = 0;
-    CodecContext *ctx = new CodecContext;
-    ctx->proc = nullptr;
-    ctx->width = lpbiIn->biWidth;
-    ctx->height = lpbiIn->biHeight;
+    }
+
+    // 4) Заполняем выходной BITMAPINFOHEADER: те же размеры, но MJPEG:
+    lpbiOut->biSize        = sizeof(BITMAPINFOHEADER);
+    lpbiOut->biWidth       = lpbiIn->biWidth;
+    lpbiOut->biHeight      = lpbiIn->biHeight;
+    lpbiOut->biPlanes      = 1;
+    lpbiOut->biBitCount    = 24;
+    lpbiOut->biCompression = mmioFOURCC('M','J','P','G');
+    lpbiOut->biSizeImage   = 0;
+
+    // 5) Создаём контекст компрессии и возвращаем его:
+    CodecContext* ctx = new CodecContext;
+    ctx->proc       = nullptr;
+    ctx->width      = lpbiIn->biWidth;
+    ctx->height     = lpbiIn->biHeight;
     ctx->outBufSize = 1024 * 1024;
-    ctx->outBuf = new BYTE[ctx->outBufSize];
+    ctx->outBuf     = new BYTE[ctx->outBufSize];
+
     return reinterpret_cast<HIC>(ctx);
 }
 
