@@ -1,3 +1,7 @@
+//------------------------------------------------------------------------------
+//  C:\Users\dmitrienko\CLionProjects\untitled\src\vfw_wrapper.cpp
+//------------------------------------------------------------------------------
+
 #include "vfw_wrapper.h"
 
 #include <fstream>
@@ -15,22 +19,22 @@ using namespace std::string_literals;
 // Глобальные (настраиваемые) пути + авто-инициализация из переменных среды
 //------------------------------------------------------------------------------
 namespace {
-std::filesystem::path g_baseDir    = L"C:\\dmitrienkomy\\python";
-std::filesystem::path g_ffmpegPath = L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
+    std::filesystem::path g_baseDir    = L"C:\\dmitrienkomy\\python";
+    std::filesystem::path g_ffmpegPath = L"C:\\dmitrienkomy\\cpp\\jxs_ffmpeg\\install-dir\\bin\\ffmpeg.exe";
 
-void initPathsFromEnv()
-{
-    static bool done = false;
-    if (done) return;
-    done = true;
+    void initPathsFromEnv()
+    {
+        static bool done = false;
+        if (done) return;
+        done = true;
 
-    if (const wchar_t* env = _wgetenv(L"JXS_VFW_BASEDIR"); env && *env)
-        g_baseDir = env;
+        if (const wchar_t* env = _wgetenv(L"JXS_VFW_BASEDIR"); env && *env)
+            g_baseDir = env;
 
-    if (const wchar_t* env = _wgetenv(L"JXS_VFW_FFMPEG"); env && *env)
-        g_ffmpegPath = env;
+        if (const wchar_t* env = _wgetenv(L"JXS_VFW_FFMPEG"); env && *env)
+            g_ffmpegPath = env;
+    }
 }
-} // namespace
 
 // ------------------------------------------------------------------+
 // UTF-16 → UTF-8
@@ -44,13 +48,14 @@ static std::string narrow(const std::wstring& ws)
 }
 
 // ------------------------------------------------------------------+
-// Захват stdout+stderr без временных файлов
+// Захват stdout+stderr через cmd.exe /C …  без временных файлов
 static std::string exec(const std::string& cmd)
 {
-    std::string fullCmd = cmd + " 2>&1";
-    std::cout << "[exec] full cmd: " << fullCmd << '\n';
+    // Оборачиваем команду в cmd.exe так, чтобы кавычки и редирект 2>&1 обрабатывались правильно
+    std::string shellCmd = "cmd.exe /C \"" + cmd + " 2>&1\"";
+    std::cout << "[exec] shell cmd: " << shellCmd << '\n';
 
-    FILE* pipe = _popen(fullCmd.c_str(), "r");
+    FILE* pipe = _popen(shellCmd.c_str(), "r");
     if (!pipe)
         return "[exec] _popen failed: "s + std::strerror(errno);
 
@@ -59,7 +64,7 @@ static std::string exec(const std::string& cmd)
     while (fgets(buf, sizeof(buf), pipe))
         out += buf;
 
-    const int rc = _pclose(pipe);
+    int rc = _pclose(pipe);
     out += "\n[exec] rc=" + std::to_string(rc);
     return out;
 }
@@ -155,9 +160,12 @@ LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
        << L" -c:v libsvtjpegxs -bpp 1.25"
        << L" \"" << outFile.wstring() << L"\"";
 
-    const std::string fullCmd = narrow(L"\"" + g_ffmpegPath.wstring() + L"\" " + ss.str());
+    // Преобразуем в UTF-8 и выполняем через cmd.exe /C
+    std::string cmd = narrow(ss.str());
+    std::string log = exec("\"" + narrow(g_ffmpegPath.wstring()) + "\" " + cmd);
+
     std::cout << "[Compress] ---------- FFmpeg LOG BEGIN ----------\n"
-              << exec(fullCmd)
+              << log
               << "\n[Compress] ----------- FFmpeg LOG END -----------\n";
 
     // 3) читаем результат -----------------------------------------------------
@@ -207,4 +215,3 @@ STDAPI DllRegisterServer()   { return S_OK; }
 STDAPI DllUnregisterServer() { return S_OK; }
 
 } // extern "C"
-//---------------------------------------------------------------------------//
