@@ -2,161 +2,272 @@ import os
 import re
 import subprocess
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
-# Paths and constants
-FFMPEG_PATH = r"C:\dmitrienkomy\cpp\jxs_ffmpeg\install-dir\bin\ffmpeg.exe"
-FFPROBE_PATH = FFMPEG_PATH.replace('ffmpeg.exe', 'ffprobe.exe')
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_COMPRESSED_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "test_data", "compressed"))
-DEFAULT_RAW_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "test_data", "raw"))
+# ----------------------------------------
+# Константы
+# ----------------------------------------
+SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
+FFMPEG_EXE     = r"C:\dmitrienkomy\cpp\jxs_ffmpeg\install-dir\bin\ffmpeg.exe"
+RAW_DIR        = os.path.join(SCRIPT_DIR, "../test_data/raw")
+COMPRESSED_DIR = os.path.join(SCRIPT_DIR, "../test_data/compressed")
 
-# Supported formats mapping: Display -> (ffmpeg pixel format, bit depth)
-COLOR_FORMATS = {
-    "YUV 420 8-bit": ("yuv420p", "8"),
-    "YUV 420 10-bit": ("yuv420p10le", "10"),
-    "YUV 420 12-bit": ("yuv420p12le", "12"),
-    "YUV 420 14-bit": ("yuv420p14le", "14"),
-    "YUV 422 8-bit": ("yuv422p", "8"),
-    "YUV 422 10-bit": ("yuv422p10le", "10"),
-    "YUV 422 12-bit": ("yuv422p12le", "12"),
-    "YUV 422 14-bit": ("yuv422p14le", "14"),
-    "YUV 444 8-bit": ("yuv444p", "8"),
-    "YUV 444 10-bit": ("yuv444p10le", "10"),
-    "YUV 444 12-bit": ("yuv444p12le", "12"),
-    "YUV 444 14-bit": ("yuv444p14le", "14"),
-    "RGB 8-bit":     ("gbrp", "8"),
-    "RGB 10-bit":    ("gbrp10le", "10"),
-    "RGB 12-bit":    ("gbrp12le", "12"),
-    "RGB 14-bit":    ("gbrp14le", "14"),
-}
+os.makedirs(RAW_DIR, exist_ok=True)
+os.makedirs(COMPRESSED_DIR, exist_ok=True)
 
-def exec_cmd(cmd):
-    """Execute command, capture combined stdout and stderr, and print shell-ready command."""
-    shell_str = ' '.join(f'"{c}"' for c in cmd)
-    print(f"[exec] Shell command: {shell_str}")
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    out, _ = process.communicate()
-    rc = process.returncode
-    log = out + f"\n[exec] rc={rc}"
-    print(log)
-    return rc, shell_str
+# ----------------------------------------
+# Утилиты
+# ----------------------------------------
+def exec_cmd(cmd_list):
+    """Выполняет cmd_list через shell, печатает команду, stdout+stderr, возвращает готовую строку."""
+    shell = " ".join(f'"{p}"' for p in cmd_list)
+    print(f"[exec] Shell command: {shell}")
+    proc = subprocess.Popen(shell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+    out, _ = proc.communicate()
+    print(out.decode(errors='ignore'))
+    print(f"[exec] rc={proc.returncode}")
+    return shell
 
+def parse_keyed_filename(path):
+    """
+    Пытается разбить имя (raw или mkv) вида:
+      base_w=1920x1080_fmt=yuv420p_depth=8[_bpp=1.25].*
+    Возвращает info dict с ключами base, width, height, resolution, pix_fmt, depth, bpp.
+    Если какого-то ключа нет в имени, значение будет None.
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    parts = name.split("_")
+    info = {"base": [], "width": None, "height": None,
+            "resolution": None, "pix_fmt": None,
+            "depth": None, "bpp": None}
+    for part in parts:
+        if part.startswith("w="):
+            wh = part[2:].split("x")
+            if len(wh) == 2 and all(p.isdigit() for p in wh):
+                info["width"], info["height"] = wh
+                info["resolution"] = f"{wh[0]}x{wh[1]}"
+        elif part.startswith("fmt="):
+            info["pix_fmt"] = part[4:]
+        elif part.startswith("depth="):
+            info["depth"] = part[6:]
+        elif part.startswith("bpp="):
+            info["bpp"] = part[4:]
+        else:
+            info["base"].append(part)
+    info["base"] = "_".join(info["base"]) or None
+    return info
 
-def get_resolution(input_path):
-    """Use ffprobe to get video resolution as WIDTHxHEIGHT."""
+def ask_if_missing(info, key, prompt, initial=""):
+    """Если info[key] None, спрашивает у пользователя через простой диалог."""
+    if not info.get(key):
+        val = simpledialog.askstring("Введите параметр", prompt, initialvalue=initial)
+        if not val:
+            raise RuntimeError(f"Нужен параметр '{key}', операция прервана.")
+        info[key] = val
+    return info[key]
+
+def probe_resolution(input_path):
+    """Пытается получить разрешение через ffprobe."""
+    probe = [
+        FFMPEG_EXE.replace("ffmpeg.exe", "ffprobe.exe"),
+        "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0", input_path
+    ]
     try:
-        cmd = [FFPROBE_PATH, '-v', 'error', '-select_streams', 'v:0',
-               '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', input_path]
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        return output.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"Resolution probe error: {e.output}")
+        out = subprocess.check_output(probe, stderr=subprocess.STDOUT, text=True).strip()
+        w, h = out.split(",")
+        return f"{w}x{h}"
+    except Exception:
         return None
 
-class ConverterGUI(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("MP4 <-> RAW Converter")
-        self.geometry("600x350")
+# ----------------------------------------
+# Конвертации
+# ----------------------------------------
+def decode_mp4_to_raw(mp4_path):
+    pix_fmt = simpledialog.askstring("PIX_FMT", "Enter pixel format (e.g., yuv420p, gbrp12le):")
+    depth   = simpledialog.askstring("DEPTH",   "Enter bit depth (e.g., 8,10,12,14):")
+    if not pix_fmt or not depth:
+        messagebox.showerror("Прервано", "Не заданы pix_fmt или depth")
+        return
 
-        tab_control = ttk.Notebook(self)
-        self.decode_tab = ttk.Frame(tab_control)
-        self.encode_tab = ttk.Frame(tab_control)
-        tab_control.add(self.decode_tab, text='Decode (MP4 -> RAW)')
-        tab_control.add(self.encode_tab, text='Encode (RAW -> MP4)')
-        tab_control.pack(expand=1, fill='both')
-
-        self._build_decode_tab()
-        self._build_encode_tab()
-
-    def _build_decode_tab(self):
-        ttk.Label(self.decode_tab, text="Select MP4 file:").grid(column=0, row=0, padx=5, pady=5, sticky='w')
-        self.mp4_path_var = tk.StringVar()
-        ttk.Entry(self.decode_tab, textvariable=self.mp4_path_var, width=50).grid(column=1, row=0, padx=5, pady=5)
-        ttk.Button(self.decode_tab, text="Browse...", command=self.browse_mp4).grid(column=2, row=0)
-
-        ttk.Label(self.decode_tab, text="Output format:").grid(column=0, row=1, padx=5, pady=5, sticky='w')
-        self.decode_format_var = tk.StringVar()
-        decode_combo = ttk.Combobox(self.decode_tab, textvariable=self.decode_format_var, state='readonly', width=30)
-        decode_combo['values'] = list(COLOR_FORMATS.keys())
-        decode_combo.grid(column=1, row=1, padx=5, pady=5)
-
-        ttk.Button(self.decode_tab, text="Decode", command=self.decode).grid(column=1, row=2, pady=10)
-
-    def _build_encode_tab(self):
-        ttk.Label(self.encode_tab, text="Select RAW file:").grid(column=0, row=0, padx=5, pady=5, sticky='w')
-        self.raw_path_var = tk.StringVar()
-        ttk.Entry(self.encode_tab, textvariable=self.raw_path_var, width=50).grid(column=1, row=0, padx=5, pady=5)
-        ttk.Button(self.encode_tab, text="Browse...", command=self.browse_raw).grid(column=2, row=0)
-
-        ttk.Button(self.encode_tab, text="Encode", command=self.encode).grid(column=1, row=1, pady=10)
-
-    def browse_mp4(self):
-        path = filedialog.askopenfilename(initialdir=DEFAULT_COMPRESSED_DIR, filetypes=[("MP4 files", "*.mp4")])
-        if path:
-            self.mp4_path_var.set(path)
-
-    def browse_raw(self):
-        path = filedialog.askopenfilename(initialdir=DEFAULT_RAW_DIR, filetypes=[("RAW files", "*.raw")])
-        if path:
-            self.raw_path_var.set(path)
-
-    def decode(self):
-        input_path = self.mp4_path_var.get()
-        fmt = self.decode_format_var.get()
-        if not input_path or not fmt:
-            messagebox.showwarning("Missing input or format", "Please select an MP4 file and output format.")
-            return
-
-        resolution = get_resolution(input_path)
+    resolution = probe_resolution(mp4_path)
+    if not resolution:
+        resolution = simpledialog.askstring("Resolution", "Enter resolution (e.g., 1920x1080):")
         if not resolution:
-            messagebox.showerror("Resolution Error", "Failed to probe video resolution. See console for details.")
+            messagebox.showerror("Прервано", "Не задано разрешение")
             return
 
-        pix_fmt, depth = COLOR_FORMATS[fmt]
-        base = os.path.splitext(os.path.basename(input_path))[0]
-        output_name = f"{base}_{resolution}_{pix_fmt}_{depth}.raw"
-        output_path = os.path.join(DEFAULT_RAW_DIR, output_name)
+    base = os.path.splitext(os.path.basename(mp4_path))[0]
+    out_name = f"{base}_w={resolution}_fmt={pix_fmt}_depth={depth}.raw"
+    raw_path = os.path.join(RAW_DIR, out_name)
 
-        cmd = [FFMPEG_PATH, '-i', input_path, '-f', 'rawvideo', '-pix_fmt', pix_fmt, output_path]
-        rc, shell_str = exec_cmd(cmd)
-        if rc == 0:
-            messagebox.showinfo("Success", f"Decoded to {output_path}\nCommand:\n{shell_str}")
-        else:
-            messagebox.showerror("Decoding Error", "See console for details.")
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-i", mp4_path,
+        "-f", "rawvideo",
+        "-pix_fmt", pix_fmt,
+        raw_path
+    ]
+    shell = exec_cmd(cmd)
+    messagebox.showinfo("Готово", f"Команда:\n{shell}")
 
-    def encode(self):
-        input_path = self.raw_path_var.get()
-        if not input_path:
-            messagebox.showwarning("Missing input", "Please select a RAW file to encode.")
-            return
+def encode_raw_to_mp4(raw_path):
+    info = parse_keyed_filename(raw_path)
+    try:
+        ask_if_missing(info, "resolution", "Enter resolution (e.g., 1920x1080):")
+        ask_if_missing(info, "pix_fmt",     "Enter source pixel format (e.g., yuv420p, gbrp12le):")
+        ask_if_missing(info, "depth",       "Enter source bit depth (e.g., 8,10,12,14):")
+    except RuntimeError as e:
+        messagebox.showerror("Прервано", str(e))
+        return
 
-        fname = os.path.splitext(os.path.basename(input_path))[0]
-        parts = fname.split('_')
-        # Expect at least 4 parts: base, resolution, pix_fmt, depth
-        if len(parts) < 4 or not re.match(r"^\d+x\d+$", parts[-3]) or parts[-2] not in [v[0] for v in COLOR_FORMATS.values()]:
-            messagebox.showerror("Invalid filename",
-                                 "Filename must be in format base_resolution_pixfmt_depth.raw,\n" +
-                                 "e.g. video_1920x1080_yuv420p_8.raw")
-            return
+    base      = info["base"] or os.path.splitext(os.path.basename(raw_path))[0]
+    resolution= info["resolution"]
+    pix_fmt   = info["pix_fmt"]
+    depth     = info["depth"]
 
-        resolution = parts[-3]
-        pix_fmt = parts[-2]
-        depth = parts[-1]
-        base = '_'.join(parts[:-3])
-        output_name = f"{base}_{resolution}_{pix_fmt}_{depth}.mp4"
-        output_path = os.path.join(DEFAULT_COMPRESSED_DIR, output_name)
+    out_name = f"{base}_w={resolution}_fmt=yuv420p_depth=8.mp4"
+    mp4_path = os.path.join(COMPRESSED_DIR, out_name)
 
-        cmd = [FFMPEG_PATH, '-f', 'rawvideo', '-pix_fmt', pix_fmt,
-               '-s', resolution, '-i', input_path,
-               '-c:v', 'mpeg4', output_path]
-        rc, shell_str = exec_cmd(cmd)
-        if rc == 0:
-            messagebox.showinfo("Success", f"Encoded to {output_path}\nCommand:\n{shell_str}")
-        else:
-            messagebox.showerror("Encoding Error", "See console for details.")
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", pix_fmt,
+        "-s:v", resolution,
+        "-i", raw_path,
+        "-c:v", "mpeg4",
+        mp4_path
+    ]
+    shell = exec_cmd(cmd)
+    messagebox.showinfo("Готово", f"Команда:\n{shell}")
 
-if __name__ == "__main__":
-    app = ConverterGUI()
-    app.mainloop()
+def encode_raw_to_jpegxs(raw_path):
+    info = parse_keyed_filename(raw_path)
+    try:
+        ask_if_missing(info, "resolution", "Enter resolution (e.g., 1920x1080):")
+        ask_if_missing(info, "pix_fmt",     "Enter source pixel format (e.g., yuv420p, gbrp12le):")
+        ask_if_missing(info, "depth",       "Enter source bit depth (e.g., 8,10,12,14):")
+        ask_if_missing(info, "bpp",         "Enter bits per pixel (e.g., 1.25):")
+    except RuntimeError as e:
+        messagebox.showerror("Прервано", str(e))
+        return
+
+    base      = info["base"] or os.path.splitext(os.path.basename(raw_path))[0]
+    resolution= info["resolution"]
+    pix_fmt   = info["pix_fmt"]
+    depth     = info["depth"]
+    bpp       = info["bpp"]
+
+    out_name = f"{base}_w={resolution}_fmt={pix_fmt}_depth={depth}_bpp={bpp}.mkv"
+    mkv_path = os.path.join(COMPRESSED_DIR, out_name)
+
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", pix_fmt,
+        "-s:v", resolution,
+        "-i", raw_path,
+        "-c:v", "libsvtjpegxs",
+        "-bpp", bpp,
+        mkv_path
+    ]
+    shell = exec_cmd(cmd)
+    messagebox.showinfo("Готово", f"Команда:\n{shell}")
+
+def decode_jpegxs_to_raw(mkv_path):
+    info = parse_keyed_filename(mkv_path)
+    try:
+        ask_if_missing(info, "pix_fmt",     "Enter pixel format used inside MKV (e.g., yuv420p, gbrp12le):")
+        ask_if_missing(info, "depth",       "Enter bit depth (e.g., 8,10,12,14):")
+        ask_if_missing(info, "resolution",  "Enter resolution (e.g., 1920x1080):")
+        # bpp не нужен для декодирования
+    except RuntimeError as e:
+        messagebox.showerror("Прервано", str(e))
+        return
+
+    base      = info["base"] or os.path.splitext(os.path.basename(mkv_path))[0]
+    resolution= info["resolution"]
+    pix_fmt   = info["pix_fmt"]
+    depth     = info["depth"]
+    bpp       = info.get("bpp")
+
+    out_name = f"{base}_w={resolution}_fmt={pix_fmt}_depth={depth}"
+    if bpp:
+        out_name += f"_bpp={bpp}"
+    out_name += ".raw"
+    raw_path = os.path.join(RAW_DIR, out_name)
+
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-i", mkv_path,
+        "-f", "rawvideo",
+        "-pix_fmt", pix_fmt,
+        raw_path
+    ]
+    shell = exec_cmd(cmd)
+    messagebox.showinfo("Готово", f"Команда:\n{shell}")
+
+# ----------------------------------------
+# GUI
+# ----------------------------------------
+root = tk.Tk()
+root.title("Video Converter")
+
+# Выбор действия
+action_var = tk.StringVar(value="MP4 → RAW")
+action_combo = ttk.Combobox(
+    root, textvariable=action_var, state="readonly",
+    values=[
+        "MP4 → RAW",
+        "RAW → MP4",
+        "RAW → JPEG-XS (.mkv)",
+        "JPEG-XS (.mkv) → RAW"
+    ]
+)
+action_combo.grid(row=0, column=0, padx=10, pady=10)
+
+# Выбор входного файла
+input_var = tk.StringVar()
+input_entry = tk.Entry(root, textvariable=input_var, width=50)
+input_entry.grid(row=1, column=0, padx=10, pady=5)
+def browse():
+    ft = [("All files","*.*")]
+    a = action_var.get()
+    if a == "MP4 → RAW":
+        ft = [("MP4","*.mp4")]
+    elif a.startswith("RAW"):
+        ft = [("RAW","*.raw")]
+    else:
+        ft = [("MKV","*.mkv")]
+    p = filedialog.askopenfilename(filetypes=ft)
+    input_var.set(p)
+ttk.Button(root, text="Browse", command=browse).grid(row=1, column=1, padx=5)
+
+# Запуск операции
+def on_run():
+    path = input_var.get()
+    if not path:
+        messagebox.showerror("Error", "Не выбран входной файл")
+        return
+    a = action_var.get()
+    try:
+        if a == "MP4 → RAW":
+            decode_mp4_to_raw(path)
+        elif a == "RAW → MP4":
+            encode_raw_to_mp4(path)
+        elif a == "RAW → JPEG-XS (.mkv)":
+            encode_raw_to_jpegxs(path)
+        elif a == "JPEG-XS (.mkv) → RAW":
+            decode_jpegxs_to_raw(path)
+    except Exception as e:
+        messagebox.showerror("Ошибка", str(e))
+
+ttk.Button(root, text="Run", command=on_run).grid(row=3, column=0, pady=10)
+
+root.mainloop()
+
