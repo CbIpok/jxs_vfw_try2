@@ -128,7 +128,7 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     // 10) Save stream
-    HANDLE hFile = CreateFileW(L"out.jxs", GENERIC_WRITE, 0, nullptr,
+    HANDLE hFile = CreateFileW(L"out.mkv", GENERIC_WRITE, 0, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile != INVALID_HANDLE_VALUE) {
         DWORD written{};

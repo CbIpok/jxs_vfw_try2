@@ -1,7 +1,4 @@
-//------------------------------------------------------------------------------
-//  C:\Users\dmitrienko\CLionProjects\untitled\src\vfw_wrapper.cpp
-//------------------------------------------------------------------------------
-
+//------C:\Users\dmitrienko\CLionProjects\untitled\src\vfw_wrapper.cpp-------
 #include "vfw_wrapper.h"
 
 #include <fstream>
@@ -9,14 +6,13 @@
 #include <iostream>
 #include <filesystem>
 #include <cstring>
-#include <cstdio>     // _popen / _pclose
 #include <cerrno>
 #include <cstdlib>    // _wgetenv
 
 using namespace std::string_literals;
 
 //------------------------------------------------------------------------------
-// Глобальные (настраиваемые) пути + авто-инициализация из переменных среды
+// Глобальные пути + авто-инициализация из переменных среды
 //------------------------------------------------------------------------------
 namespace {
     std::filesystem::path g_baseDir    = L"C:\\dmitrienkomy\\python";
@@ -34,45 +30,72 @@ namespace {
         if (const wchar_t* env = _wgetenv(L"JXS_VFW_FFMPEG"); env && *env)
             g_ffmpegPath = env;
     }
+
+    // Запуск FFmpeg с перенаправлением stdin/stdout
+    void startFFmpeg(CodecContext* ctx)
+    {
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+        HANDLE inRd, inWr, outRd, outWr;
+
+        if (!CreatePipe(&inRd,  &inWr,  &sa, 0) ||
+            !CreatePipe(&outRd, &outWr, &sa, 0))
+        {
+            std::cerr << "[Start] CreatePipe failed\n";
+            return;
+        }
+
+        // Чтобы child-процесс не наследовал лишние концы:
+        SetHandleInformation(inWr,  HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(outRd, HANDLE_FLAG_INHERIT, 0);
+
+        STARTUPINFOW si{ sizeof(si) };
+        si.dwFlags    = STARTF_USESTDHANDLES;
+        si.hStdInput  = inRd;   // child читает здесь
+        si.hStdOutput = outWr;  // child пишет сюда
+        si.hStdError  = outWr;  // stderr → stdout
+
+        std::wstringstream cmd;
+        cmd << L"\"" << g_ffmpegPath.wstring() << L"\" -y "
+            L"-f rawvideo -pix_fmt gbrp12le "
+            L"-s:v " << ctx->width << L"x" << ctx->height << L" "
+            L"-i pipe:0 "
+            L"-c:v libsvtjpegxs -bpp 1.25 "
+            L"-f matroska pipe:1";
+
+        PROCESS_INFORMATION pi;
+        if (!CreateProcessW(
+                nullptr,
+                cmd.str().data(),
+                nullptr, nullptr,
+                TRUE,               // унаследовать дескрипторы
+                CREATE_NO_WINDOW,
+                nullptr, nullptr,
+                &si, &pi))
+        {
+            std::cerr << "[Start] CreateProcessW failed, err=" << GetLastError() << "\n";
+            CloseHandle(inRd);
+            CloseHandle(inWr);
+            CloseHandle(outRd);
+            CloseHandle(outWr);
+            return;
+        }
+
+        // сохраняем родительские концы
+        ctx->ffmpegStdin  = inWr;
+        ctx->ffmpegStdout = outRd;
+        ctx->ffmpegProc   = pi.hProcess;
+
+        // ненужное в родителе закрываем
+        CloseHandle(inRd);
+        CloseHandle(outWr);
+        CloseHandle(pi.hThread);
+    }
 }
 
-// ------------------------------------------------------------------+
-// UTF-16 → UTF-8
-static std::string narrow(const std::wstring& ws)
-{
-    if (ws.empty()) return {};
-    int n = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string out(n - 1, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), n, nullptr, nullptr);
-    return out;
-}
+//------------------------------------------------------------------------------
+// VFW API реализации
+//------------------------------------------------------------------------------
 
-// ------------------------------------------------------------------+
-// Захват stdout+stderr через cmd.exe /C …  без временных файлов
-static std::string exec(const std::string& cmd)
-{
-    // Оборачиваем команду в cmd.exe так, чтобы кавычки и редирект 2>&1 обрабатывались правильно
-    std::string shellCmd = "cmd.exe /C \"" + cmd + " 2>&1\"";
-    std::cout << "[exec] shell cmd: " << shellCmd << '\n';
-
-    FILE* pipe = _popen(shellCmd.c_str(), "r");
-    if (!pipe)
-        return "[exec] _popen failed: "s + std::strerror(errno);
-
-    std::string out;
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), pipe))
-        out += buf;
-
-    int rc = _pclose(pipe);
-    out += "\n[exec] rc=" + std::to_string(rc);
-    return out;
-}
-
-// ------------------------------------------------------------------+
-extern "C" {
-
-//— ICInfo / ICLocate остаются без изменений —----------------------------------
 BOOL VFWAPI ICInfo(DWORD, DWORD, ICINFO* lpicinfo)
 {
     if (!lpicinfo) return FALSE;
@@ -105,18 +128,16 @@ HIC VFWAPI ICLocate(DWORD fccType, DWORD fccHandler,
     return reinterpret_cast<HIC>(1);
 }
 
-// ------------------------------------------------------------------+
 BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn)
 {
-    std::cout << "[ICSeqCompressFrameStart]\n";
     initPathsFromEnv();
 
-    auto ctx   = new CodecContext{};
-    ctx->width  = lpbiIn->bmiHeader.biWidth;
-    ctx->height = lpbiIn->bmiHeader.biHeight;
-    ctx->outBuf.resize(1024 * 1024);                 // стартовый объём 1 MiB
+    auto ctx = new CodecContext{};
+    ctx->width   = lpbiIn->bmiHeader.biWidth;
+    ctx->height  = lpbiIn->bmiHeader.biHeight;
+    ctx->baseDir = g_baseDir;
+    ctx->outBuf.clear();
 
-    ctx->baseDir = g_baseDir;                        // <- теперь настраиваемо
     std::error_code ec;
     std::filesystem::create_directories(ctx->baseDir, ec);
     if (ec)
@@ -124,81 +145,70 @@ BOOL VFWAPI ICSeqCompressFrameStart(PCOMPVARS pc, LPBITMAPINFO lpbiIn)
     else
         std::cout << "[Start] baseDir=" << ctx->baseDir.u8string() << '\n';
 
+    startFFmpeg(ctx);
     pc->lpState = ctx;
     return TRUE;
 }
 
-// ------------------------------------------------------------------+
 LPVOID VFWAPI ICSeqCompressFrame(PCOMPVARS pc, UINT, LPVOID lpBits,
                                  BOOL* pfKey, LONG* plSize)
 {
-    initPathsFromEnv();
     auto ctx = reinterpret_cast<CodecContext*>(pc->lpState);
-    if (!ctx) return nullptr;
-
-    const auto inFile  = ctx->baseDir / L"in.raw";
-    const auto outFile = ctx->baseDir / L"out.mkv";
-
-    // 1) сохраняем кадр -------------------------------------------------------
-    {
-        std::ofstream ofs(inFile, std::ios::binary);
-        ofs.write(static_cast<char*>(lpBits),
-                  static_cast<std::streamsize>(ctx->width) *
-                  static_cast<std::streamsize>(ctx->height) * 6);
-    }
-
-    // 2) собираем и запускаем FFmpeg -----------------------------------------
-    std::wcout << L"[Compress] FFmpeg "
-               << (std::filesystem::exists(g_ffmpegPath) ? L"found" : L"NOT found")
-               << L" at " << g_ffmpegPath << L'\n';
-
-    std::wstringstream ss;
-    ss << L"-y -f rawvideo"
-       << L" -pix_fmt gbrp12le"
-       << L" -s:v " << ctx->width << L"x" << ctx->height
-       << L" -i \"" << inFile.wstring() << L"\""
-       << L" -c:v libsvtjpegxs -bpp 1.25"
-       << L" \"" << outFile.wstring() << L"\"";
-
-    // Преобразуем в UTF-8 и выполняем через cmd.exe /C
-    std::string cmd = narrow(ss.str());
-    std::string log = exec("\"" + narrow(g_ffmpegPath.wstring()) + "\" " + cmd);
-
-    std::cout << "[Compress] ---------- FFmpeg LOG BEGIN ----------\n"
-              << log
-              << "\n[Compress] ----------- FFmpeg LOG END -----------\n";
-
-    // 3) читаем результат -----------------------------------------------------
-    if (!std::filesystem::exists(outFile)) {
-        std::cerr << "[Compress] out.mkv not found\n";
+    if (!ctx || ctx->ffmpegStdin == INVALID_HANDLE_VALUE)
         return nullptr;
+
+    // 1) пишем кадр
+    DWORD written = 0;
+    WriteFile(ctx->ffmpegStdin, lpBits, ctx->width * ctx->height * 6, &written, nullptr);
+
+    // 2) читаем доступные данные
+    DWORD available = 0;
+    std::vector<BYTE> buf;
+    if (PeekNamedPipe(ctx->ffmpegStdout, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+        buf.resize(available);
+        DWORD readBytes = 0;
+        ReadFile(ctx->ffmpegStdout, buf.data(), available, &readBytes, nullptr);
+        buf.resize(readBytes);
     }
 
-    std::ifstream ifs(outFile, std::ios::binary | std::ios::ate);
-    const size_t size = static_cast<size_t>(ifs.tellg());
-    ifs.seekg(0);
-
-    if (size > ctx->outBuf.size()) {
-        ctx->outBuf.resize(size);
-        std::cout << "[Compress] grow outBuf to " << size << " bytes\n";
-    }
-    ifs.read(reinterpret_cast<char*>(ctx->outBuf.data()), size);
-
-    *pfKey  = TRUE;
-    *plSize = static_cast<LONG>(size);
-    std::cout << "[Compress] compressed size = " << size << '\n';
+    ctx->outBuf = std::move(buf);
+    *pfKey      = TRUE;
+    *plSize     = static_cast<LONG>(ctx->outBuf.size());
     return ctx->outBuf.data();
 }
 
-// ------------------------------------------------------------------+
 void VFWAPI ICSeqCompressFrameEnd(PCOMPVARS pc)
 {
-    std::cout << "[ICSeqCompressFrameEnd]\n";
-    delete reinterpret_cast<CodecContext*>(pc->lpState);
+    auto ctx = reinterpret_cast<CodecContext*>(pc->lpState);
+    if (!ctx) return;
+
+    // закрываем stdin → ffmpeg допишет трейлер и выйдет
+    CloseHandle(ctx->ffmpegStdin);
+
+    // считываем остаток stdout
+    std::vector<BYTE> trailer;
+    for (;;) {
+        BYTE temp[4096];
+        DWORD r = 0;
+        if (!ReadFile(ctx->ffmpegStdout, temp, sizeof(temp), &r, nullptr) || r == 0)
+            break;
+        trailer.insert(trailer.end(), temp, temp + r);
+    }
+
+    // ждём завершения ffmpeg
+    WaitForSingleObject(ctx->ffmpegProc, INFINITE);
+    CloseHandle(ctx->ffmpegStdout);
+    CloseHandle(ctx->ffmpegProc);
+
+    delete ctx;
     pc->lpState = nullptr;
 }
 
-//— новые экспортируемые функции —---------------------------------------------
+// COM-регистрация (заглушки)
+STDAPI DllRegisterServer()   { return S_OK; }
+STDAPI DllUnregisterServer() { return S_OK; }
+
+// Конфигурация путей
 void WINAPI JXSVFW_SetBaseDir(const wchar_t* dir)
 {
     if (dir && *dir)
@@ -210,8 +220,3 @@ void WINAPI JXSVFW_SetFFmpegPath(const wchar_t* path)
     if (path && *path)
         g_ffmpegPath = path;
 }
-
-STDAPI DllRegisterServer()   { return S_OK; }
-STDAPI DllUnregisterServer() { return S_OK; }
-
-} // extern "C"
