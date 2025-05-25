@@ -1,2 +1,4 @@
 /.idea
 /cmake-build-debug
+/scripts/.idea
+/test_data
